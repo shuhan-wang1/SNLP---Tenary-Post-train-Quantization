@@ -166,16 +166,24 @@ class GPTQ:
                 else:
                     remaining_cols = torch.arange(col_idx + block_size, self.columns, device=self.device)
                 
-                if len(remaining_cols) > 0:
-                    # Error compensation: W_remaining -= error @ H_inv_block_to_remaining
-                    for i, b_idx in enumerate(block_indices):
-                        err_i = quant_error[:, i:i+1]  # (rows, 1)
-                        h_inv_diag = H_inv[b_idx, b_idx].clamp(min=1e-8)
-                        
-                        for j, r_idx in enumerate(remaining_cols):
-                            h_inv_ij = H_inv[b_idx, r_idx]
-                            W[:, r_idx] -= (err_i.squeeze() * h_inv_ij / h_inv_diag)
-            
+                # ✅ 优化后的实现：直接使用矩阵乘法一次性更新所有剩余列
+            if len(remaining_cols) > 0:
+                # 1. 提取当前块对应的 H_inv 行：H_inv[block, remaining]
+                # shape: (block_size, num_remaining)
+                H_inv_block_rem = H_inv[block_indices][:, remaining_cols]
+                
+                # 2. 提取对角线元素并调整维度
+                # shape: (block_size, 1)
+                H_inv_diag = H_inv[block_indices, block_indices].unsqueeze(1).clamp(min=1e-8)
+                
+                # 3. 计算系数矩阵 (H_inv_ij / H_inv_ii)
+                # shape: (block_size, num_remaining)
+                coefficients = H_inv_block_rem / H_inv_diag
+                
+                # 4. 向量化更新：W_rem -= Error_block @ Coefficients
+                # quant_error shape: (rows, block_size)
+                # update shape: (rows, num_remaining)
+                W[:, remaining_cols] -= quant_error @ coefficients
             col_idx += block_size
         
         # Finalize permutation

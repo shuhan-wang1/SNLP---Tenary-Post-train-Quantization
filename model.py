@@ -140,6 +140,15 @@ def get_llm_layers(model: nn.Module, model_type: str = 'llama') -> List[nn.Modul
     """Get transformer layers from different model architectures."""
     if model_type == 'llama' or model_type == 'llama2' or model_type == 'llama3':
         return model.model.layers
+    elif model_type == 'gemma' or model_type == 'gemma3':
+        # Gemma3 multimodal: model.language_model.layers
+        # Gemma3 text-only: model.model.layers
+        if hasattr(model, 'language_model') and hasattr(model.language_model, 'layers'):
+            return model.language_model.layers
+        elif hasattr(model, 'model') and hasattr(model.model, 'layers'):
+            return model.model.layers
+        else:
+            raise AttributeError(f"Cannot find layers in Gemma model")
     elif model_type == 'qwen' or model_type == 'qwen3':
         return model.model.layers
     elif model_type == 'opt':
@@ -243,12 +252,12 @@ def load_model_for_quantization(model_name: str,
         tokenizer.pad_token = tokenizer.eos_token
     
     model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        config=config,
-        torch_dtype=dtype,
-        device_map=device,
-        trust_remote_code=True,
-    )
+    model_name,
+    torch_dtype=torch.float16,
+    device_map="auto",
+    load_in_8bit=False,  # Add this
+    trust_remote_code=True,
+)
     
     model.eval()
     
@@ -259,7 +268,11 @@ def get_model_type(model_name: str) -> str:
     """Infer model type from name."""
     model_name_lower = model_name.lower()
     
-    if 'llama-3' in model_name_lower or 'llama3' in model_name_lower:
+    if 'gemma-3' in model_name_lower or 'gemma3' in model_name_lower:
+        return 'gemma3'
+    elif 'gemma' in model_name_lower:
+        return 'gemma'
+    elif 'llama-3' in model_name_lower or 'llama3' in model_name_lower:
         return 'llama3'
     elif 'llama-2' in model_name_lower or 'llama2' in model_name_lower:
         return 'llama2'

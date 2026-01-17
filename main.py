@@ -26,8 +26,8 @@ from model import (
     compute_model_size
 )
 from quantizer import AsymmetricTernaryQuantizer, compute_quantization_error, compute_output_error
-from reorder import SSRReorderer, select_next_block_ssr
-from gptq import GPTQ
+from reorder import SSRReorderer, select_next_block_ssr, get_ssr_permutation
+from gptq import GPTQ, WINDOW_SIZE
 from utils import (
     set_seed,
     get_calibration_data,
@@ -35,6 +35,11 @@ from utils import (
     compute_bits_per_weight,
     save_quantized_model
 )
+
+
+class StopForwardException(Exception):
+    """Exception used to stop forward pass after capturing first layer inputs."""
+    pass
 
 
 class PT2LLMQuantizer:
@@ -55,6 +60,8 @@ class PT2LLMQuantizer:
                  num_calibration_samples: int = 128,
                  seq_len: int = 2048,
                  use_ssr: bool = True,
+                 use_precomputed_ssr: bool = True,
+                 window_size: int = WINDOW_SIZE,
                  percdamp: float = 0.01,
                  seed: int = 42,
                  device: str = 'cuda'):
@@ -67,6 +74,8 @@ class PT2LLMQuantizer:
             num_calibration_samples: Number of calibration samples
             seq_len: Sequence length for calibration
             use_ssr: Whether to use SSR reordering
+            use_precomputed_ssr: Use K-Means precomputed SSR (faster) vs dynamic SSR
+            window_size: Window size for GPTQ error propagation (default 2048)
             percdamp: GPTQ dampening factor
             seed: Random seed
             device: Device for computation
@@ -78,12 +87,14 @@ class PT2LLMQuantizer:
         self.num_calibration_samples = num_calibration_samples
         self.seq_len = seq_len
         self.use_ssr = use_ssr
+        self.use_precomputed_ssr = use_precomputed_ssr
+        self.window_size = window_size
         self.percdamp = percdamp
         self.seed = seed
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
-        
+
         set_seed(seed)
-        
+
         # Store quantization results
         self.quantized_params: Dict[str, Dict[str, torch.Tensor]] = {}
         
@@ -100,38 +111,43 @@ class PT2LLMQuantizer:
         )
     
     @torch.no_grad()
-    def quantize_layer(self, 
+    def quantize_layer(self,
                        layer: nn.Linear,
                        layer_name: str,
                        calibration_activations: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
         Quantize a single linear layer using PT2-LLM method.
-        
+
+        Optimizations applied:
+        1. K-Means precomputed SSR (O(m*k) instead of O(m^2))
+        2. Windowed error propagation (only update nearby columns)
+        3. Reduced ITF iterations (5 instead of 100)
+
         Args:
             layer: Linear layer to quantize
             layer_name: Name of the layer
             calibration_activations: Input activations for calibration
-            
+
         Returns:
             Dictionary containing quantized parameters
         """
         W = layer.weight.data.clone().to(self.device)
         n, m = W.shape  # (out_features, in_features)
-        
+
         # Reshape activations: (B, L, m) -> (B*L, m)
         if calibration_activations.dim() == 3:
             X = calibration_activations.reshape(-1, calibration_activations.shape[-1]).to(self.device)
         else:
             X = calibration_activations.to(self.device)
-        
+
         # Compute Hessian: H = X^T X
         H = X.T @ X
         H = H / X.shape[0]
-        
+
         # Add dampening
         damp = self.percdamp * torch.diag(H).mean()
         H.diagonal().add_(damp)
-        
+
         # Compute Hessian inverse
         H = H.float()
         try:
@@ -139,89 +155,102 @@ class PT2LLMQuantizer:
             H_inv = torch.cholesky_inverse(H_chol)
         except RuntimeError:
             H_inv = torch.linalg.pinv(H)
-        print(H.device, H_inv.device)  # 应该是 cuda
+
         # Initialize storage
         T_full = torch.zeros(n, m, dtype=torch.int8, device=self.device)
         alpha_list = []
         mu_list = []
-        
-        # Initialize column order
+
+        # ========== SSR Reordering Strategy ==========
         if self.use_ssr:
-            remaining_indices = torch.arange(m, device=self.device)
-            perm_list = []
+            if self.use_precomputed_ssr:
+                # Optimized: Precompute full permutation using K-Means clustering
+                perm = get_ssr_permutation(W, self.block_size)
+                # Reorder W, X, H, H_inv according to permutation
+                W = W[:, perm]
+                X = X[:, perm]
+                H = H[perm][:, perm]
+                H_inv = H_inv[perm][:, perm]
+            else:
+                # Original: Dynamic block selection (slower)
+                remaining_indices = torch.arange(m, device=self.device)
+                perm_list = []
         else:
             perm = torch.arange(m, device=self.device)
-        
-        # ATQ quantizer
+
+        # ATQ quantizer (with reduced iterations: default now 5 instead of 100)
         atq = AsymmetricTernaryQuantizer()
-        
+
         # Block-wise quantization
         processed_cols = 0
         while processed_cols < m:
             # Select block columns
-            if self.use_ssr and len(remaining_indices) > 0:
+            if self.use_ssr and not self.use_precomputed_ssr:
+                # Dynamic SSR
                 block_indices, remaining_indices = select_next_block_ssr(
                     W, remaining_indices, self.block_size
                 )
                 perm_list.extend(block_indices.tolist())
+                block_size = len(block_indices)
             else:
+                # Sequential (either no SSR or precomputed SSR already reordered W)
                 end_idx = min(processed_cols + self.block_size, m)
                 block_indices = torch.arange(processed_cols, end_idx, device=self.device)
-            
-            block_size = len(block_indices)
+                block_size = len(block_indices)
+
             if block_size == 0:
                 break
-            
+
             # Extract block
             W_block = W[:, block_indices]
             X_block = X[:, block_indices]
-            
+
             # Apply ATQ (ITF + AGA)
             alpha_b, mu_b, T_b = atq.quantize(W_block, X_block)
-            
+
             # Store results
             alpha_list.append(alpha_b)
             mu_list.append(mu_b)
             T_full[:, block_indices] = T_b.to(torch.int8)
-            
+
             # GPTQ error compensation
             W_quant_block = alpha_b * T_b + mu_b
             quant_error = W_block - W_quant_block
-            
-            # Propagate error to remaining columns
-            if self.use_ssr:
+
+            # ========== Windowed Error Propagation ==========
+            if self.use_ssr and not self.use_precomputed_ssr:
                 remaining_cols = remaining_indices
             else:
                 remaining_cols = torch.arange(processed_cols + block_size, m, device=self.device)
-            
-            # ✅ 优化后的实现：直接使用矩阵乘法一次性更新所有剩余列
+
             if len(remaining_cols) > 0:
-                # 1. 提取当前块对应的 H_inv 行：H_inv[block, remaining]
-                # shape: (block_size, num_remaining)
-                H_inv_block_rem = H_inv[block_indices][:, remaining_cols]
-                
-                # 2. 提取对角线元素并调整维度
-                # shape: (block_size, 1)
+                # Windowed update: only update the nearest window_size columns
+                # Exploits diagonal-dominant structure of H_inv after SSR reordering
+                limit = min(len(remaining_cols), self.window_size)
+                update_cols = remaining_cols[:limit]
+
+                # Extract H_inv[block, update_cols]
+                H_inv_block_rem = H_inv[block_indices][:, update_cols]
+
+                # Extract diagonal elements
                 H_inv_diag = H_inv[block_indices, block_indices].unsqueeze(1).clamp(min=1e-8)
-                
-                # 3. 计算系数矩阵 (H_inv_ij / H_inv_ii)
-                # shape: (block_size, num_remaining)
+
+                # Compute coefficients
                 coefficients = H_inv_block_rem / H_inv_diag
-                
-                # 4. 向量化更新：W_rem -= Error_block @ Coefficients
-                # quant_error shape: (rows, block_size)
-                # update shape: (rows, num_remaining)
-                W[:, remaining_cols] -= quant_error @ coefficients
+
+                # Vectorized update
+                W[:, update_cols] -= quant_error @ coefficients
+
             processed_cols += block_size
-        
+
         # Finalize permutation
-        if self.use_ssr:
+        if self.use_ssr and not self.use_precomputed_ssr:
             perm = torch.tensor(perm_list, device=self.device, dtype=torch.long)
-        
+
         # Stack block parameters
         alpha = torch.cat(alpha_list, dim=1)
         mu = torch.cat(mu_list, dim=1)
-        
+
         return {
             'alpha': alpha.cpu(),
             'mu': mu.cpu(),
@@ -231,83 +260,173 @@ class PT2LLMQuantizer:
     
     def quantize(self) -> Dict[str, Dict[str, torch.Tensor]]:
         """
-        Quantize the entire model layer by layer.
-        
+        Quantize the entire model layer by layer using Hook-based Input Caching.
+
+        Optimization: Instead of running the full model for each layer (O(L*N) forward passes),
+        we cache inputs at the first layer using pre-hooks and propagate them layer-by-layer
+        (O(N) forward passes). This reduces quantization time by ~L times (number of layers).
+
         Returns:
             Dictionary mapping layer names to quantized parameters
         """
         print("="*60)
-        print("PT2-LLM: Post-Training Ternarization")
+        print("PT2-LLM: Post-Training Ternarization (Hook-based Optimization)")
         print("="*60)
-        
+
         start_time = time.time()
-        
-        # Get calibration data
+
+        # Get calibration data and layers
         calibration_samples = self.get_calibration_data()
-        
-        # Get transformer layers
         layers = get_llm_layers(self.model, self.model_type)
         num_layers = len(layers)
-        
+
         print(f"\nQuantizing {num_layers} transformer layers...")
         print(f"Block size: {self.block_size}, SSR: {self.use_ssr}")
         print("-"*60)
-        
-        # Process layer by layer
-        for layer_idx, layer in enumerate(tqdm(layers, desc="Layers")):
-            layer_activations = {}
-            hooks = []
-            
-            # Register hooks to capture activations
-            def make_hook(name):
-                def hook(module, inp, out):
-                    if isinstance(inp, tuple):
-                        inp = inp[0]
-                    if name not in layer_activations:
-                        layer_activations[name] = []
-                    layer_activations[name].append(inp.detach())
-                return hook
-            
-            # Find linear layers in this transformer layer
-            linear_layers = find_linear_layers(layer)
-            
-            for name, linear in linear_layers.items():
-                hooks.append(linear.register_forward_hook(make_hook(name)))
-            
-            # Collect activations through forward pass
-            self.model.eval()
-            with torch.no_grad():
-                for sample in calibration_samples:
+
+        # =========================================================
+        # Phase 1: Cache first layer inputs using pre-hook
+        # =========================================================
+        print("Phase 1: Caching inputs for the first layer...")
+        inps = []
+        cache = {'attention_mask': None, 'position_ids': None, 'cache_position': None}
+
+        def input_catcher_hook(module, args, kwargs):
+            """Pre-hook to capture inputs before the first layer executes."""
+            # Capture hidden states (usually args[0] or kwargs['hidden_states'])
+            if len(args) > 0:
+                inps.append(args[0].detach())
+            elif 'hidden_states' in kwargs:
+                inps.append(kwargs['hidden_states'].detach())
+            else:
+                print(f"Warning: Could not find hidden_states. kwargs keys: {list(kwargs.keys())}")
+                return
+
+            # Cache auxiliary parameters (only first time)
+            if cache['attention_mask'] is None:
+                cache['attention_mask'] = kwargs.get('attention_mask')
+            if cache['position_ids'] is None:
+                cache['position_ids'] = kwargs.get('position_ids')
+            if cache['cache_position'] is None:
+                cache['cache_position'] = kwargs.get('cache_position')
+
+            # Interrupt forward pass
+            print(".", end="", flush=True)
+            raise StopForwardException()
+
+        # Register pre-hook on first layer (works regardless of device_map)
+        handle = layers[0].register_forward_pre_hook(input_catcher_hook, with_kwargs=True)
+
+        # Run forward passes (will be interrupted at first layer by hook)
+        self.model.eval()
+        with torch.no_grad():
+            for sample in calibration_samples:
+                try:
                     sample = sample.to(self.device)
                     self.model(sample)
-            
+                except StopForwardException:
+                    pass  # Expected interruption
+
+        # Remove hook to restore normal model behavior
+        handle.remove()
+        print(f"\nSuccessfully cached {len(inps)} inputs.")
+
+        # Validate that we captured inputs
+        if len(inps) == 0:
+            raise RuntimeError(
+                "CRITICAL: Input caching failed! The hook was not triggered. "
+                "Check model structure and get_llm_layers() implementation."
+            )
+
+        # =========================================================
+        # Phase 2: Layer-wise quantization with input propagation
+        # =========================================================
+        print(f"Phase 2: Processing {num_layers} layers sequentially...")
+
+        attention_mask = cache['attention_mask']
+        position_ids = cache['position_ids']
+        cache_position = cache['cache_position']
+
+        for layer_idx in tqdm(range(num_layers), desc="Quantizing Layers"):
+            # Move current layer to compute device
+            layer = layers[layer_idx].to(self.device)
+
+            # Find linear layers and prepare to capture their inputs
+            linear_layers = find_linear_layers(layer)
+            subset_inputs = {name: [] for name in linear_layers}
+
+            # Register hooks to capture inputs to each linear layer
+            def get_inner_hook(name):
+                def hook(module, inp, out):
+                    # inp[0] is (Batch, Seq, Dim)
+                    subset_inputs[name].append(inp[0].detach())
+                return hook
+
+            handles = []
+            for name, linear in linear_layers.items():
+                handles.append(linear.register_forward_hook(get_inner_hook(name)))
+
+            # Forward pass through current layer, collecting linear inputs
+            new_inps = []
+            with torch.no_grad():
+                for inp in inps:
+                    inp = inp.to(self.device)
+
+                    # Build layer kwargs
+                    layer_kwargs = {}
+                    if attention_mask is not None:
+                        layer_kwargs['attention_mask'] = attention_mask
+                    if position_ids is not None:
+                        layer_kwargs['position_ids'] = position_ids
+                    if cache_position is not None:
+                        layer_kwargs['cache_position'] = cache_position
+
+                    # Run single layer forward
+                    out = layer(inp, **layer_kwargs)
+
+                    # Handle tuple outputs
+                    if isinstance(out, tuple):
+                        out = out[0]
+
+                    new_inps.append(out)
+
             # Remove hooks
-            for hook in hooks:
-                hook.remove()
-            
-            # Quantize each linear layer
+            for h in handles:
+                h.remove()
+
+            # Update inputs for next layer
+            inps = new_inps
+
+            # Quantize each linear layer in this transformer layer
             for name, linear in linear_layers.items():
                 full_name = f"layer_{layer_idx}.{name}"
-                
-                if name in layer_activations and len(layer_activations[name]) > 0:
-                    activations = torch.cat(layer_activations[name], dim=0)
-                    params = self.quantize_layer(linear, full_name, activations)
+
+                if len(subset_inputs[name]) > 0:
+                    # Concatenate all samples: (Total_Tokens, Dim)
+                    X = torch.cat(subset_inputs[name], dim=0)
+
+                    # Run quantization (GPTQ/SSR/ATQ)
+                    params = self.quantize_layer(linear, full_name, X)
                     self.quantized_params[full_name] = params
-                    
-                    # Replace weight with quantized version
+
+                    # Replace with fake-quantized weights for error calibration
                     W_quant = self._dequantize_weight(params)
                     linear.weight.data = W_quant.to(linear.weight.device, linear.weight.dtype)
-            
-            # Clear cache
-            del layer_activations
+
+                    # Free memory
+                    del X
+                    subset_inputs[name] = None
+
+            # Memory cleanup
             gc.collect()
-            torch.cuda.empty_cache() if torch.cuda.is_available() else None
-        
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
         elapsed = time.time() - start_time
         print("-"*60)
         print(f"Quantization completed in {elapsed:.1f}s")
         print(f"Total quantized layers: {len(self.quantized_params)}")
-        
+
         return self.quantized_params
     
     def _dequantize_weight(self, params: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -353,6 +472,10 @@ def main():
                         help='Sequence length for calibration (default: 2048)')
     parser.add_argument('--no_ssr', action='store_true',
                         help='Disable SSR reordering')
+    parser.add_argument('--dynamic_ssr', action='store_true',
+                        help='Use dynamic SSR instead of precomputed K-Means SSR (slower but original method)')
+    parser.add_argument('--window_size', type=int, default=WINDOW_SIZE,
+                        help=f'Window size for GPTQ error propagation (default: {WINDOW_SIZE})')
     parser.add_argument('--percdamp', type=float, default=0.01,
                         help='GPTQ dampening factor (default: 0.01)')
     
@@ -394,6 +517,8 @@ def main():
         num_calibration_samples=args.num_samples,
         seq_len=args.seq_len,
         use_ssr=not args.no_ssr,
+        use_precomputed_ssr=not args.dynamic_ssr,
+        window_size=args.window_size,
         percdamp=args.percdamp,
         seed=args.seed,
         device=args.device

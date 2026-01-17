@@ -9,7 +9,14 @@ Reference: PT2-LLM Section 3.3
 """
 
 import torch
-from typing import Tuple, List
+import numpy as np
+from typing import Tuple, List, Optional
+
+try:
+    from sklearn.cluster import KMeans
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
 
 
 def compute_cosine_similarity_matrix(W: torch.Tensor) -> torch.Tensor:
@@ -207,15 +214,122 @@ def apply_permutation_to_input(X: torch.Tensor, perm: torch.Tensor) -> torch.Ten
 def compute_block_variance(W: torch.Tensor, block_size: int) -> List[float]:
     """
     Compute variance within each block for analysis.
-    
+
     Lower variance indicates more homogeneous blocks, which is better for ternarization.
     """
     n, m = W.shape
     variances = []
-    
+
     for i in range(0, m, block_size):
         end = min(i + block_size, m)
         block = W[:, i:end]
         variances.append(block.var().item())
-    
+
     return variances
+
+
+def precompute_ssr_perm(W: torch.Tensor, block_size: int, n_sample_rows: int = 128) -> torch.Tensor:
+    """
+    Use K-Means pre-clustering to replace dynamic SSR block selection.
+
+    Mathematical basis:
+    - K-Means minimizes: sum_k sum_{i in C_k} ||w_i - mu_k||^2
+    - For normalized vectors: ||w_i - w_j||^2 = 2(1 - cos(w_i, w_j))
+    - Therefore K-Means implicitly optimizes cosine similarity within clusters,
+      achieving the same goal as dynamic SSR but with O(m*k*iter) instead of O(m^2)
+
+    Args:
+        W: Weight matrix of shape (n, m), where m is the number of columns to reorder
+        block_size: Size of quantization blocks
+        n_sample_rows: Number of rows to sample for clustering (default 128)
+
+    Returns:
+        perm: Permutation indices of shape (m,) that groups similar columns together
+    """
+    if not SKLEARN_AVAILABLE:
+        raise ImportError(
+            "scikit-learn is required for precompute_ssr_perm. "
+            "Install it with: pip install scikit-learn"
+        )
+
+    n, m = W.shape
+    n_clusters = max(1, m // block_size)
+
+    # Dimensionality reduction: sample rows to speed up clustering
+    # This works because column similarity is preserved under random projection
+    actual_sample = min(n_sample_rows, n)
+    sample_indices = torch.randperm(n, device=W.device)[:actual_sample]
+
+    # W_sample: (m, actual_sample) - each row is a column's feature vector
+    W_sample = W[sample_indices, :].T.float().cpu().numpy()
+
+    # Normalize for better clustering (makes K-Means equivalent to spherical K-Means)
+    norms = np.linalg.norm(W_sample, axis=1, keepdims=True)
+    norms = np.clip(norms, 1e-8, None)
+    W_sample_normalized = W_sample / norms
+
+    # Fast K-Means clustering
+    kmeans = KMeans(
+        n_clusters=n_clusters,
+        n_init=3,          # Reduced from default 10
+        max_iter=50,       # Reduced from default 300
+        random_state=42,
+        algorithm='lloyd'  # Use Lloyd's algorithm (fastest for dense data)
+    )
+    labels = kmeans.fit_predict(W_sample_normalized)
+
+    # Sort by cluster label to group similar columns together
+    # Within each cluster, maintain relative order
+    perm = np.argsort(labels, kind='stable')
+
+    return torch.tensor(perm, dtype=torch.long, device=W.device)
+
+
+def precompute_ssr_perm_fallback(W: torch.Tensor, block_size: int) -> torch.Tensor:
+    """
+    Fallback SSR permutation using cosine similarity without sklearn.
+
+    Uses a fast approximation: sort columns by their similarity to the global mean.
+    This is O(nm) instead of O(m^2) but less accurate than K-Means.
+
+    Args:
+        W: Weight matrix of shape (n, m)
+        block_size: Size of quantization blocks
+
+    Returns:
+        perm: Permutation indices of shape (m,)
+    """
+    n, m = W.shape
+
+    # Compute global mean vector
+    w_mean = W.mean(dim=1, keepdim=True)  # (n, 1)
+
+    # Normalize
+    w_mean_norm = w_mean / (w_mean.norm().clamp(min=1e-8))
+    W_norm = W / (W.norm(dim=0, keepdim=True).clamp(min=1e-8))
+
+    # Compute similarity to mean for each column
+    similarities = (W_norm.T @ w_mean_norm).squeeze()  # (m,)
+
+    # Sort by similarity (descending - most similar first)
+    perm = torch.argsort(similarities, descending=True)
+
+    return perm
+
+
+def get_ssr_permutation(W: torch.Tensor, block_size: int, use_kmeans: bool = True) -> torch.Tensor:
+    """
+    Get SSR permutation using the best available method.
+
+    Args:
+        W: Weight matrix of shape (n, m)
+        block_size: Size of quantization blocks
+        use_kmeans: Whether to use K-Means (if available)
+
+    Returns:
+        perm: Permutation indices of shape (m,)
+    """
+    if use_kmeans and SKLEARN_AVAILABLE:
+        return precompute_ssr_perm(W, block_size)
+    else:
+        return precompute_ssr_perm_fallback(W, block_size)

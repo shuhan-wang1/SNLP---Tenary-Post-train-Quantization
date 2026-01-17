@@ -15,7 +15,11 @@ from typing import Optional, Tuple, Dict, Any
 import math
 
 from quantizer import AsymmetricTernaryQuantizer
-from reorder import SSRReorderer, select_next_block_ssr, compute_column_similarity_to_mean
+from reorder import SSRReorderer, select_next_block_ssr, compute_column_similarity_to_mean, get_ssr_permutation
+
+# Windowed error propagation: only update nearby columns for O(NMK) instead of O(NM^2)
+# Based on Hessian's diagonal-dominant structure after SSR reordering
+WINDOW_SIZE = 2048
 
 
 class GPTQ:
@@ -28,28 +32,31 @@ class GPTQ:
     3. Hessian-guided error compensation
     """
     
-    def __init__(self, layer: nn.Linear, block_size: int = 128, percdamp: float = 0.01):
+    def __init__(self, layer: nn.Linear, block_size: int = 128, percdamp: float = 0.01,
+                 window_size: int = WINDOW_SIZE):
         """
         Args:
             layer: Linear layer to quantize
             block_size: Number of columns per quantization block
             percdamp: Dampening factor for Hessian inverse
+            window_size: Window size for error propagation (default 2048)
         """
         self.layer = layer
         self.block_size = block_size
         self.percdamp = percdamp
-        
+        self.window_size = window_size
+
         self.device = layer.weight.device
         self.dtype = layer.weight.dtype
-        
+
         # Weight shape: (out_features, in_features)
         W = layer.weight.data.clone()
         self.rows, self.columns = W.shape
-        
+
         # Initialize Hessian
         self.H = torch.zeros((self.columns, self.columns), device=self.device, dtype=self.dtype)
         self.nsamples = 0
-        
+
         # Storage for quantized parameters
         self.alpha = None
         self.mu = None
@@ -75,13 +82,15 @@ class GPTQ:
         self.H += inp @ inp.t()
         self.nsamples += batch_size
     
-    def quantize(self, use_ssr: bool = True) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def quantize(self, use_ssr: bool = True, use_precomputed_ssr: bool = True) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Perform PT2-LLM quantization with GPTQ error compensation.
-        
+
         Args:
             use_ssr: Whether to use SSR column reordering
-            
+            use_precomputed_ssr: If True, use K-Means precomputed permutation (faster);
+                                 If False, use dynamic block selection (original method)
+
         Returns:
             alpha: Scaling factors for each block, shape (rows, num_blocks)
             mu: Offsets for each block, shape (rows, num_blocks)
@@ -89,14 +98,14 @@ class GPTQ:
             perm: Column permutation indices
         """
         W = self.layer.weight.data.clone()
-        
+
         # Normalize Hessian
         H = self.H / self.nsamples
-        
+
         # Add dampening for numerical stability
         damp = self.percdamp * torch.diag(H).mean()
         H.diagonal().add_(damp)
-        
+
         # Compute Hessian inverse using Cholesky decomposition
         try:
             H_inv = torch.linalg.cholesky(H)
@@ -104,98 +113,109 @@ class GPTQ:
         except RuntimeError:
             # Fallback to pseudo-inverse if Cholesky fails
             H_inv = torch.linalg.pinv(H)
-        
+
         # Initialize output tensors
         T_full = torch.zeros_like(W)
         alpha_blocks = []
         mu_blocks = []
-        
-        # Track column ordering
+
+        # ========== SSR Reordering Strategy ==========
         if use_ssr:
-            remaining_indices = torch.arange(self.columns, device=self.device)
-            perm_list = []
+            if use_precomputed_ssr:
+                # Optimized: Precompute full permutation using K-Means clustering
+                # O(m*k*iter) instead of O(m^2) for dynamic SSR
+                perm = get_ssr_permutation(W, self.block_size)
+                # Reorder W and H_inv according to permutation
+                W = W[:, perm]
+                H_inv = H_inv[perm][:, perm]
+                H = H[perm][:, perm]
+            else:
+                # Original: Dynamic block selection (slower)
+                remaining_indices = torch.arange(self.columns, device=self.device)
+                perm_list = []
         else:
             perm = torch.arange(self.columns, device=self.device)
-        
+
         # ATQ quantizer
         atq = AsymmetricTernaryQuantizer()
-        
-        # Process blocks
+
+        # Process blocks sequentially (after reordering, just iterate in order)
         col_idx = 0
         while col_idx < self.columns:
             # Determine block columns
-            if use_ssr and col_idx < self.columns:
-                # SSR: Select columns most similar to remaining mean
-                block_size = min(self.block_size, len(remaining_indices))
+            if use_ssr and not use_precomputed_ssr:
+                # Dynamic SSR: Select columns most similar to remaining mean
                 block_indices, remaining_indices = select_next_block_ssr(
                     W, remaining_indices, self.block_size
                 )
                 perm_list.extend(block_indices.tolist())
+                block_size = len(block_indices)
             else:
-                # Sequential order
+                # Sequential order (either no SSR or precomputed SSR already reordered W)
                 end_idx = min(col_idx + self.block_size, self.columns)
                 block_indices = torch.arange(col_idx, end_idx, device=self.device)
-            
-            block_size = len(block_indices)
-            
+                block_size = len(block_indices)
+
+            if block_size == 0:
+                break
+
             # Extract block weights and corresponding Hessian elements
             W_block = W[:, block_indices]
-            H_inv_block = H_inv[block_indices][:, block_indices]
-            
+
             # Collect calibration data for this block
             # For AGA, we need the covariance structure
             X_block = H[:, block_indices][block_indices, :]  # Approximate with Hessian submatrix
-            
+
             # Apply ATQ to block (ITF + AGA)
             alpha_b, mu_b, T_b = atq.quantize(W_block, X_block.unsqueeze(0) if X_block.dim() == 2 else X_block)
-            
+
             # Store block results
             alpha_blocks.append(alpha_b)
             mu_blocks.append(mu_b)
             T_full[:, block_indices] = T_b
-            
+
             # Compute quantization error for this block
             W_quant_block = alpha_b * T_b + mu_b
             quant_error = W_block - W_quant_block
-            
-            # GPTQ error compensation: propagate error to remaining columns
-            if col_idx + block_size < self.columns:
-                # Remaining column indices
-                if use_ssr:
-                    remaining_cols = remaining_indices
-                else:
-                    remaining_cols = torch.arange(col_idx + block_size, self.columns, device=self.device)
-                
-                # ✅ 优化后的实现：直接使用矩阵乘法一次性更新所有剩余列
+
+            # ========== GPTQ Error Compensation with Windowing ==========
+            # Remaining column indices
+            if use_ssr and not use_precomputed_ssr:
+                remaining_cols = remaining_indices
+            else:
+                remaining_cols = torch.arange(col_idx + block_size, self.columns, device=self.device)
+
             if len(remaining_cols) > 0:
-                # 1. 提取当前块对应的 H_inv 行：H_inv[block, remaining]
-                # shape: (block_size, num_remaining)
-                H_inv_block_rem = H_inv[block_indices][:, remaining_cols]
-                
-                # 2. 提取对角线元素并调整维度
-                # shape: (block_size, 1)
+                # Windowed update: only update the nearest WINDOW_SIZE columns
+                # This exploits the diagonal-dominant structure of H_inv after SSR reordering
+                # Reduces complexity from O(NM^2) to O(NMK) where K = window_size
+                limit = min(len(remaining_cols), self.window_size)
+                update_cols = remaining_cols[:limit]
+
+                # 1. Extract H_inv[block, update_cols]
+                H_inv_block_rem = H_inv[block_indices][:, update_cols]
+
+                # 2. Extract diagonal elements
                 H_inv_diag = H_inv[block_indices, block_indices].unsqueeze(1).clamp(min=1e-8)
-                
-                # 3. 计算系数矩阵 (H_inv_ij / H_inv_ii)
-                # shape: (block_size, num_remaining)
+
+                # 3. Compute coefficients
                 coefficients = H_inv_block_rem / H_inv_diag
-                
-                # 4. 向量化更新：W_rem -= Error_block @ Coefficients
-                # quant_error shape: (rows, block_size)
-                # update shape: (rows, num_remaining)
-                W[:, remaining_cols] -= quant_error @ coefficients
+
+                # 4. Vectorized update
+                W[:, update_cols] -= quant_error @ coefficients
+
             col_idx += block_size
-        
+
         # Finalize permutation
-        if use_ssr:
+        if use_ssr and not use_precomputed_ssr:
             perm = torch.tensor(perm_list, device=self.device)
-        
+
         # Stack block parameters
         self.alpha = torch.cat(alpha_blocks, dim=1)  # (rows, num_blocks)
         self.mu = torch.cat(mu_blocks, dim=1)        # (rows, num_blocks)
         self.T = T_full
         self.perm = perm
-        
+
         return self.alpha, self.mu, self.T, perm
     
     def get_quantized_weight(self) -> torch.Tensor:
